@@ -574,6 +574,8 @@ def _ai_core(req: "AIRequest", x_telegram_init_data: Optional[str] = None, strea
     user = None
     requests_today = 0
     checkin_context = ""
+    _tm = {}            # замер по блокам: где именно уходит ожидание
+    _tprev = _t.time()
     exercises_context = ""
 
     with SessionLocal() as db:
@@ -635,6 +637,7 @@ def _ai_core(req: "AIRequest", x_telegram_init_data: Optional[str] = None, strea
                 pass
 
         # Цели пользователя
+        _tm["чекин+юзер"] = _t.time() - _tprev; _tprev = _t.time()
         goals_context = ""
         if user:
             try:
@@ -679,6 +682,7 @@ def _ai_core(req: "AIRequest", x_telegram_init_data: Optional[str] = None, strea
             pass
 
         # Спорт-активность за последние 30 дней
+        _tm["цели+упражнения"] = _t.time() - _tprev; _tprev = _t.time()
         sport_context = ""
         if user:
             try:
@@ -714,6 +718,7 @@ def _ai_core(req: "AIRequest", x_telegram_init_data: Optional[str] = None, strea
                 pass
 
         # Последние 10 тренировок + прогресс за 90 дней
+        _tm["спорт"] = _t.time() - _tprev; _tprev = _t.time()
         workouts_context = ""
         if user:
             try:
@@ -725,12 +730,22 @@ def _ai_core(req: "AIRequest", x_telegram_init_data: Optional[str] = None, strea
                     ORDER BY w.date DESC LIMIT 10
                 """), {"uid": user.id}).fetchall()
                 if recent_wk:
+                    # Подходы всех десяти тренировок забираем ОДНИМ запросом.
+                    # Раньше здесь был цикл с запросом на каждую тренировку: десять
+                    # лишних обращений к базе подряд, и на них уходила заметная часть
+                    # тех секунд, что человек ждал до первого слова тренера.
+                    _wids = ",".join(str(int(w.id)) for w in recent_wk)
+                    _all_sets = db.execute(text(f"""
+                        SELECT workout_id, exercise_name, weight, reps, rpe
+                        FROM workout_sets WHERE workout_id IN ({_wids}) ORDER BY id
+                    """)).fetchall()
+                    _sets_by_wk = {}
+                    for _s in _all_sets:
+                        _sets_by_wk.setdefault(_s.workout_id, []).append(_s)
+
                     wk_parts = []
                     for wk in recent_wk:
-                        sets_rows = db.execute(text("""
-                            SELECT exercise_name, weight, reps, rpe
-                            FROM workout_sets WHERE workout_id=:wid ORDER BY id
-                        """), {"wid": wk.id}).fetchall()
+                        sets_rows = _sets_by_wk.get(wk.id, [])
                         ex_grouped = {}
                         for s in sets_rows:
                             w = s.weight
@@ -816,6 +831,7 @@ def _ai_core(req: "AIRequest", x_telegram_init_data: Optional[str] = None, strea
                 logger.error(f"workouts_context: {e}")
 
         # Добавки пользователя
+        _tm["тренировки"] = _t.time() - _tprev; _tprev = _t.time()
         supplements_context = ""
         if user:
             try:
@@ -888,6 +904,7 @@ def _ai_core(req: "AIRequest", x_telegram_init_data: Optional[str] = None, strea
                 pass
 
         # Питание за сегодня
+        _tm["добавки+вода+вес+замеры"] = _t.time() - _tprev; _tprev = _t.time()
         nutrition_context = ""
         if user:
             try:
@@ -911,6 +928,8 @@ def _ai_core(req: "AIRequest", x_telegram_init_data: Optional[str] = None, strea
             except Exception:
                 try: db.rollback()
                 except: pass
+
+        _tm["питание"] = _t.time() - _tprev; _tprev = _t.time()
 
     # ── Шаг 2: вызываем Anthropic API ВНЕ транзакции БД ─────────────────────
     lang = (user.lang if user else None) or "ru"
@@ -1097,6 +1116,8 @@ def _ai_core(req: "AIRequest", x_telegram_init_data: Optional[str] = None, strea
         # Первый вопрос — передаём полный контекст
         messages = [{"role": "user", "content": context}]
         system_prompt = None
+    if _tm:
+        logger.info("[ai context] " + " | ".join(f"{k} {v:.1f}с" for k, v in _tm.items()))
     logger.info(
         f"[ai] режим={_mode or 'auto'} план={is_workout_question} разбор={is_review_question} "
         f"история={len(chat_history)} сообщ. сессия={req.session_id or '—'}"
