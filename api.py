@@ -467,8 +467,88 @@ class AIRequest(BaseModel):
     # None — старые клиенты, тогда режим определяется по ключевым словам, как раньше.
     mode: Optional[str] = None
 
-@app.post("/api/ai/ask")
-async def ai_ask(req: AIRequest, x_telegram_init_data: Optional[str] = Header(None)):
+_ANSWER_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f"}
+
+
+def _answer_fragment(raw: str):
+    """Текущее значение поля answer из JSON, который может быть не дописан.
+
+    Возвращает None, если поля ещё не видно. Это важно именно для потока:
+    если вместо None вернуть исходную строку, то в самом начале наружу уйдёт
+    кусок разметки вроде `{"answer` — и человек увидит её в чате.
+
+    Разбор останавливается на незаконченной экранированной последовательности
+    (хвост `\\` или неполный `\\uXXXX`): её второй символ придёт следующим
+    куском, а отданное наружу уже не отозвать.
+    """
+    import re as _re_s
+    m = _re_s.search(r'"answer"\s*:\s*"', raw)
+    if not m:
+        return None
+    out, i, n = [], m.end(), len(raw)
+    while i < n:
+        ch = raw[i]
+        if ch == '"':
+            break                      # строка закрылась — дальше идёт план
+        if ch == "\\":
+            if i + 1 >= n:
+                break                  # экранирование не дописано
+            nxt = raw[i + 1]
+            if nxt == "u":
+                if i + 6 > n:
+                    break              # \uXXXX не дописан
+                try:
+                    cp = int(raw[i + 2:i + 6], 16)
+                except ValueError:
+                    break
+                if 0xD800 <= cp <= 0xDBFF:
+                    # Старшая половина суррогатной пары — так модель пишет эмодзи.
+                    # Сама по себе это не символ: такую строку нельзя закодировать
+                    # в UTF-8, и отдача её наружу обрывала соединение посреди
+                    # ответа. Ждём младшую половину.
+                    if i + 12 > n or raw[i + 6:i + 8] != "\\u":
+                        break
+                    try:
+                        lo = int(raw[i + 8:i + 12], 16)
+                    except ValueError:
+                        break
+                    if not (0xDC00 <= lo <= 0xDFFF):
+                        break
+                    out.append(chr(0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)))
+                    i += 12
+                    continue
+                if 0xDC00 <= cp <= 0xDFFF:
+                    break              # младшая половина без старшей — мусор
+                out.append(chr(cp))
+                i += 6
+                continue
+            out.append(_ANSWER_ESCAPES.get(nxt, nxt))
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _salvage_answer(raw: str) -> str:
+    """Текст тренера из ответа, который не разобрался как JSON.
+
+    Ответ может упереться в max_tokens посреди структуры — тогда json.loads
+    падает, и раньше в чат уходил сырой `{"answer": "Хорошая работа, но жим...`.
+    """
+    frag = _answer_fragment(raw)
+    return (frag or "").strip() or raw
+
+
+def _ai_core(req: "AIRequest", x_telegram_init_data: Optional[str] = None, stream_cb=None) -> dict:
+    """Общее тело ответа тренера.
+
+    stream_cb=None — обычный вызов, ответ возвращается целиком.
+    stream_cb(кусок текста) — ответ стримится: модель отдаёт JSON по кускам, мы
+    на лету достаём из него поле answer и отдаём наружу только новый хвост.
+    Всё остальное — контекст, история, лимиты, разбор плана — общее, чтобы два
+    пути не разъехались.
+    """
     import time as _t
     _t0 = _t.time()   # замер: где уходит время — в базе или у Anthropic
     if not ANTHROPIC_API_KEY:
@@ -1101,6 +1181,48 @@ async def ai_ask(req: AIRequest, x_telegram_init_data: Optional[str] = Header(No
                 return _create_message(_depth + 1, **kw)
             raise
 
+    def _stream_message(_depth=0, **kw):
+        """То же самое, но потоком, с отдачей текста по мере генерации.
+
+        Схема ответа ставит answer первым полем, поэтому модель сначала пишет
+        текст тренера и только потом состав. Значит текст можно показывать сразу,
+        не дожидаясь, пока дорисуется план: достаём из незаконченного JSON текущее
+        значение answer и отдаём только то, что прибавилось с прошлого раза.
+        """
+        sent = 0
+        buf = []
+        # Ждём JSON ровно тогда, когда сами просили схему. Если откат её снял,
+        # ответ придёт прозой, и её надо показывать как есть.
+        expect_json = "output_config" in kw
+        try:
+            with client.messages.stream(**kw) as s:
+                for piece in s.text_stream:
+                    buf.append(piece)
+                    cur = "".join(buf)
+                    shown = _answer_fragment(cur) if expect_json else cur
+                    if shown is not None and len(shown) > sent:
+                        try:
+                            stream_cb(shown[sent:])
+                        except Exception:
+                            pass
+                        sent = len(shown)
+                return "".join(buf), s.get_final_message()
+        except Exception as e:
+            msg = str(e)
+            if _depth >= 2 or sent > 0:
+                # Часть текста уже ушла человеку — повторять вызов нельзя,
+                # иначе он увидит два ответа подряд.
+                raise
+            if ("output_config" in msg or "schema" in msg.lower()) and "output_config" in kw:
+                logger.warning(f"[ai] схема не поддержана в потоке, отключаю её: {e}")
+                kw.pop("output_config", None)
+                return _stream_message(_depth + 1, **kw)
+            if ("cache_control" in msg or "system" in msg.lower()) and isinstance(kw.get("system"), list):
+                logger.warning(f"[ai] кэширование не поддержано в потоке, отключаю: {e}")
+                kw["system"] = "\n".join(b.get("text", "") for b in kw["system"])
+                return _stream_message(_depth + 1, **kw)
+            raise
+
     _kw = {
         "model": "claude-sonnet-4-6",
         # Плану нужен запас в любом случае: в структурированном ответе идут и текст
@@ -1123,7 +1245,11 @@ async def ai_ask(req: AIRequest, x_telegram_init_data: Optional[str] = Header(No
         _kw["max_tokens"] = 2000
 
     _t_ctx = _t.time()
-    message = _create_message(**_kw)
+    _streamed_text = None
+    if stream_cb is None:
+        message = _create_message(**_kw)
+    else:
+        _streamed_text, message = _stream_message(**_kw)
     _t_api = _t.time()
     try:
         _u = getattr(message, "usage", None)
@@ -1140,6 +1266,7 @@ async def ai_ask(req: AIRequest, x_telegram_init_data: Optional[str] = Header(No
             f"ответ Anthropic {(_t_api - _t_ctx):.1f}с | "
             f"токены вход {_in}, в кэш записано {_cache_w}, из кэша прочитано {_cache}, "
             f"выход {_out} | схема {'да' if 'output_config' in _kw else 'нет'}"
+            f"{' | поток' if stream_cb is not None else ''}"
         )
     except Exception:
         pass
@@ -1155,35 +1282,15 @@ async def ai_ask(req: AIRequest, x_telegram_init_data: Optional[str] = Header(No
          if getattr(b, "type", "text") == "text" and getattr(b, "text", None)),
         "",
     )
+    # В потоке итоговое сообщение иногда приходит без тела — тогда берём то,
+    # что собрали из кусков. Разбор ниже один и тот же для обоих путей.
+    if not raw_answer and _streamed_text:
+        raw_answer = _streamed_text
 
     # Извлекаем workout_plan
     workout_plan = None
     save_requested = False
     import re as _re, json as _json
-
-    def _salvage_answer(raw: str) -> str:
-        """Достать поле answer из недописанного JSON.
-
-        Ответ может упереться в max_tokens посреди структуры. Тогда json.loads
-        падает, и раньше в чат уходил сырой `{"answer": "Хорошая работа, но жим...`.
-        Здесь вытаскиваем сам текст, даже если закрывающей кавычки нет.
-        """
-        m = _re.search(r'"answer"\s*:\s*"', raw)
-        if not m:
-            return raw
-        out, i, n = [], m.end(), len(raw)
-        while i < n:
-            ch = raw[i]
-            if ch == "\\" and i + 1 < n:
-                nxt = raw[i + 1]
-                out.append({"n": "\n", "t": "\t", "r": "\r"}.get(nxt, nxt))
-                i += 2
-                continue
-            if ch == '"':
-                break
-            out.append(ch)
-            i += 1
-        return "".join(out).strip() or raw
 
     if getattr(message, "stop_reason", None) == "max_tokens":
         logger.warning(f"[ai] ответ упёрся в max_tokens ({_kw.get('max_tokens')}) — возможна обрезка")
@@ -1316,6 +1423,116 @@ async def ai_ask(req: AIRequest, x_telegram_init_data: Optional[str] = Header(No
             # Попросил сохранить словами в чате — приложение само откроет выбор даты.
             # Модель сохранять не умеет, раньше она просто отвечала «сохранил».
             "save_requested": save_requested}
+
+
+_AI_LIMITER = None
+
+
+def _ai_limiter():
+    """Сколько запросов к тренеру можно держать одновременно.
+
+    Остальные эндпоинты объявлены синхронными, и FastAPI уже гоняет их через
+    общий пул потоков. Ответ тренера занимает слот на 13–18 секунд, поэтому без
+    отдельного ограничителя десяток параллельных запросов к AI подвесил бы весь
+    API, включая главный экран и профиль.
+    """
+    global _AI_LIMITER
+    if _AI_LIMITER is None:
+        import anyio as _a
+        _AI_LIMITER = _a.CapacityLimiter(8)
+    return _AI_LIMITER
+
+
+async def _in_thread(fn, abandon: bool = False):
+    """Выполнить блокирующую работу в потоке, не занимая общий пул целиком.
+
+    abandon=True освобождает обработчик сразу при отмене (человек ушёл с экрана),
+    но этот параметр появился только в anyio 4.1, а в requirements версия не
+    закреплена — она приходит вместе с fastapi. Поэтому на старой версии тихо
+    обходимся без него, вместо того чтобы валить весь AI с TypeError.
+    """
+    import anyio as _a
+    lim = _ai_limiter()
+    if abandon:
+        try:
+            return await _a.to_thread.run_sync(fn, abandon_on_cancel=True, limiter=lim)
+        except TypeError:
+            pass
+    return await _a.to_thread.run_sync(fn, limiter=lim)
+
+
+@app.post("/api/ai/ask")
+async def ai_ask(req: AIRequest, x_telegram_init_data: Optional[str] = Header(None)):
+    """Ответ тренера целиком. Запасной путь для клиентов без потока."""
+    return await _in_thread(lambda: _ai_core(req, x_telegram_init_data))
+
+
+@app.post("/api/ai/ask-stream")
+async def ai_ask_stream(req: AIRequest, x_telegram_init_data: Optional[str] = Header(None)):
+    """Тот же ответ, но потоком (SSE).
+
+    Генерация занимает 13–18 секунд, и всё это время человек смотрел в пустой
+    экран. Текст тренера идёт первым полем схемы, поэтому слова появляются
+    примерно через полторы секунды, а состав тренировки приезжает последним
+    событием, когда план дописан.
+
+    События: {"type":"delta","text":...} — кусок текста;
+             {"type":"done", ...}        — ответ целиком, план, save_requested;
+             {"type":"error","status":N} — ошибка, клиент откатывается на /ai/ask.
+    """
+    import asyncio as _asyncio, json as _js
+    from fastapi.responses import StreamingResponse
+
+    q: "_asyncio.Queue" = _asyncio.Queue()
+    loop = _asyncio.get_running_loop()
+
+    def _cb(chunk: str):
+        # Вызывается из рабочего потока — в цикл событий попадаем только так
+        loop.call_soon_threadsafe(q.put_nowait, {"type": "delta", "text": chunk})
+
+    async def _run():
+        try:
+            # abandon=True: человек ушёл с экрана — обработчик освобождается
+            # сразу, не дожидаясь, пока поток догенерирует ненужный уже ответ.
+            result = await _in_thread(
+                lambda: _ai_core(req, x_telegram_init_data, _cb), abandon=True)
+            await q.put({"type": "done", **result})
+        except HTTPException as e:
+            await q.put({"type": "error", "status": e.status_code, "detail": str(e.detail)})
+        except Exception as e:
+            logger.warning(f"[ai stream] {e}")
+            await q.put({"type": "error", "status": 500, "detail": "AI error"})
+        finally:
+            await q.put(None)
+
+    def _sse(item):
+        txt = _js.dumps(item, ensure_ascii=False)
+        try:
+            txt.encode("utf-8")
+        except UnicodeEncodeError:
+            # Подстраховка: если в текст всё же просочилась половина суррогата,
+            # соединение рвать нельзя — уходим на экранированный вид.
+            txt = _js.dumps(item, ensure_ascii=True)
+        return f"data: {txt}\n\n"
+
+    async def _gen():
+        task = _asyncio.create_task(_run())
+        try:
+            while True:
+                item = await q.get()
+                if item is None:
+                    break
+                yield _sse(item)
+        finally:
+            if not task.done():
+                task.cancel()
+
+    return StreamingResponse(_gen(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        # Без этого прокси буферизует поток и весь смысл теряется
+        "X-Accel-Buffering": "no",
+    })
 
 
 @app.get("/api/ai/history/{tg_id}", dependencies=[Depends(verify_tg_user)])
