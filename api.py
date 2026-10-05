@@ -2137,15 +2137,133 @@ def start_workout(tg_id: int, req: StartWorkoutRequest):
         user = db.execute(text("SELECT id FROM users WHERE telegram_id=:tg_id"), {"tg_id": tg_id}).fetchone()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
-        result = db.execute(text("""
+        _started = datetime.utcnow().replace(tzinfo=None)
+        db.execute(text("""
             INSERT INTO workouts (user_id, date, status, total_volume)
-            VALUES (:uid, :now, 'active', 0) RETURNING id
-        """), {"uid": user.id, "now": datetime.utcnow().replace(tzinfo=None)})
-        db.commit()
+            VALUES (:uid, :now, 'active', 0)
+        """), {"uid": user.id, "now": _started})
+        # Берём id из последовательности на ТОМ ЖЕ соединении, до commit.
+        # «Последняя строка пользователя» не годится: при двойном тапе два запроса
+        # вставляют по строке, и оба получают id второй — подходы первого уходили
+        # бы в чужую тренировку. RETURNING здесь нельзя, pg8000 его не умеет.
         wid = db.execute(text(
-            "SELECT id FROM workouts WHERE user_id=:uid ORDER BY date DESC LIMIT 1"
-        ), {"uid": user.id}).fetchone().id
+            "SELECT currval(pg_get_serial_sequence('workouts','id'))"
+        )).scalar()
+        db.commit()
+        wid = int(wid)
+
+        # Состав запоминаем сразу. Раньше exercise_ids приходил и выбрасывался —
+        # сервер не знал, из чего состоит тренировка, и восстановить её после
+        # закрытия приложения было нечем.
+        import json as _js_sw
+        _state = {
+            "exIds": [int(i) for i in (req.exercise_ids or [])][:30],
+            "curIdx": 0,
+            "step": 4,                      # шаг записи подходов
+            "plannedWorkoutId": req.planned_workout_id,
+        }
+        try:
+            db.execute(text("""
+                UPDATE workouts SET ui_state = :st, ui_state_at = :now WHERE id = :wid
+            """), {"st": _js_sw.dumps(_state, ensure_ascii=False), "now": _started, "wid": wid})
+            db.commit()
+        except Exception as e:
+            logger.warning(f"[состояние] не записал состав при старте: {e}")
         return {"workout_id": wid}
+
+
+# Предел на размер состояния. Больше этого в тренировку не помещается
+# при любом разумном составе, а всё что больше — мусор или ошибка клиента.
+WORKOUT_STATE_MAX = 20000
+
+
+class WorkoutStateRequest(BaseModel):
+    state: dict
+
+
+@app.put("/api/workout/{workout_id}/state", dependencies=[Depends(verify_tg_user)])
+def save_workout_state(workout_id: int, req: WorkoutStateRequest, tg_id: int):
+    """Сохранить состояние активной тренировки.
+
+    Приложение присылает его при каждом заметном изменении: сменилось упражнение,
+    закончилась разминка, записан подход. Подходы сюда не входят — они пишутся
+    отдельным запросом в workout_sets и остаются единственным источником правды.
+    """
+    import json as _js_st
+    with SessionLocal() as db:
+        user = db.execute(text("SELECT id FROM users WHERE telegram_id=:tg_id"), {"tg_id": tg_id}).fetchone()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        # Чужую тренировку править нельзя, даже зная её id
+        # Резать строку посередине нельзя: обрезанный JSON не разберётся никогда,
+        # и состояние тренировки окажется потеряно навсегда. Если не влезает —
+        # выбрасываем советы по упражнениям, они восстановимы, а состав нет.
+        _payload = dict(req.state or {})
+        _dump = _js_st.dumps(_payload, ensure_ascii=False)
+        if len(_dump) > WORKOUT_STATE_MAX:
+            _payload.pop("exerciseTips", None)
+            _dump = _js_st.dumps(_payload, ensure_ascii=False)
+        if len(_dump) > WORKOUT_STATE_MAX:
+            raise HTTPException(status_code=413, detail="State too large")
+        res = db.execute(text("""
+            UPDATE workouts SET ui_state = :st, ui_state_at = :now
+            WHERE id = :wid AND user_id = :uid AND status = 'active'
+        """), {"st": _dump,
+               "now": datetime.utcnow(), "wid": workout_id, "uid": user.id})
+        db.commit()
+        if res.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Active workout not found")
+    return {"ok": True}
+
+
+@app.get("/api/workout/{tg_id}/active", dependencies=[Depends(verify_tg_user)])
+def get_active_workout(tg_id: int):
+    """Активная тренировка целиком: состояние плюс уже записанные подходы.
+
+    Нужно, чтобы продолжить с того же места после закрытия приложения — или
+    с другого устройства. Подходы берём из workout_sets, а не из состояния:
+    они пишутся синхронно при каждом подходе и разойтись не могут.
+    """
+    import json as _js_ga
+    with SessionLocal() as db:
+        user = db.execute(text("SELECT id FROM users WHERE telegram_id=:tg_id"), {"tg_id": tg_id}).fetchone()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        wk = db.execute(text("""
+            SELECT id, date, ui_state, ui_state_at FROM workouts
+            WHERE user_id = :uid AND status = 'active'
+            ORDER BY id DESC LIMIT 1
+        """), {"uid": user.id}).fetchone()
+        if not wk:
+            return {"found": False}
+
+        state = {}
+        if wk.ui_state:
+            try:
+                state = _js_ga.loads(wk.ui_state) or {}
+            except Exception as e:
+                logger.warning(f"[состояние] не разобрал ui_state тренировки {wk.id}: {e}")
+
+        rows = db.execute(text("""
+            SELECT exercise_id, exercise_name, set_number, reps, weight, rpe
+            FROM workout_sets WHERE workout_id = :wid ORDER BY id
+        """), {"wid": wk.id}).fetchall()
+        sets = {}
+        for r in rows:
+            key = str(r.exercise_id) if r.exercise_id else (r.exercise_name or "")
+            sets.setdefault(key, []).append({
+                "weight": float(r.weight) if r.weight else 0,
+                "reps": r.reps or 0,
+                "rpe": r.rpe,
+            })
+        return {
+            "found": True,
+            "workout_id": wk.id,
+            "started_at": wk.date.isoformat() if wk.date else None,
+            "state": state,
+            "state_at": wk.ui_state_at.isoformat() if wk.ui_state_at else None,
+            "sets": sets,
+        }
 
 
 class LogSetRequest(BaseModel):
@@ -2268,7 +2386,12 @@ def finish_workout(workout_id: int, req: FinishWorkoutRequest, tg_id: int):
             raise HTTPException(status_code=404, detail="User not found")
         # Считаем калории: МЕТ 6.0 для силовой тренировки
         weight = float(user[1] or 75)
-        dur = req.duration_minutes or 0
+        # Потолок на длительность: приложение могло прислать часы, если тренировку
+        # продолжили с другого устройства и отсчёт начался от создания записи.
+        # Пять часов — заведомо больше любой реальной тренировки.
+        dur = min(int(req.duration_minutes or 0), 300)
+        if (req.duration_minutes or 0) > 300:
+            logger.warning(f"[тренировка] {workout_id}: длительность {req.duration_minutes} мин урезана до 300")
         calories_burned = round(6.0 * weight * (dur / 60)) if dur > 0 else 0
         db.execute(text("""
             UPDATE workouts SET status='finished', duration_minutes=:dur, calories_burned=:cal
@@ -3906,10 +4029,15 @@ def close_active_workout(tg_id: int):
                    (SELECT COUNT(*) FROM workout_sets ws WHERE ws.workout_id = w.id) AS sets
             FROM workouts w
             WHERE w.user_id = :uid AND w.status = 'active'
-            ORDER BY w.date DESC LIMIT 1
+            ORDER BY w.id DESC LIMIT 1
         """), {"uid": user.id}).fetchone()
         if not wk:
             return {"ok": True, "action": "none"}
+        # Та же выборка, что в start_workout и get_active_workout: раньше здесь
+        # было ORDER BY date, и при двух записях с одной отметкой времени кнопка
+        # закрывала не ту тренировку, которую видел человек.
+        # Висящий отдых тоже снимаем — иначе вибрация придёт после закрытия.
+        _cancel_rest(user.id)
 
         if wk.sets == 0:
             db.execute(text("DELETE FROM workouts WHERE id = :wid"), {"wid": wk.id})
