@@ -359,7 +359,8 @@ def get_user(tg_id: int):
                    consent_terms_at, consent_basic_at, consent_health_at, consent_ai_at,
                    ai_tone, created_at,
                    COALESCE(total_points,0) AS total_points,
-                   COALESCE(user_rank,'beginner') AS user_rank
+                   COALESCE(user_rank,'beginner') AS user_rank,
+                   COALESCE(rest_notify, FALSE) AS rest_notify, rest_notify_offered_at
             FROM users WHERE telegram_id=:tg_id
         """), {"tg_id": tg_id}).fetchone()
         if not user:
@@ -397,6 +398,10 @@ def get_user(tg_id: int):
             "medical_conditions": user.medical_conditions or [],
             "allergies": user.allergies or [],
             "profile_complete": user.profile_complete,
+            # Уведомления об отдыхе. offered говорит, предлагали ли уже включить:
+            # предложение показывается один раз, после первой тренировки.
+            "rest_notify": bool(user.rest_notify),
+            "rest_notify_offered": bool(user.rest_notify_offered_at),
             "consent_given_at": user.consent_given_at.isoformat() if user.consent_given_at else None,
             "consent_version": user.consent_version,
             "consent_platform": user.consent_platform,
@@ -530,6 +535,8 @@ class UserUpdateRequest(BaseModel):
     ai_tone: Optional[str] = None
     medical_conditions: Optional[list] = None
     allergies: Optional[list] = None
+    rest_notify: Optional[bool] = None           # уведомления об окончании отдыха
+    rest_notify_offered: Optional[bool] = None   # предложение показано, больше не показывать
 
 class AIRequest(BaseModel):
     question: str
@@ -1747,6 +1754,17 @@ def update_user(tg_id: int, req: UserUpdateRequest):
             import json
             fields.append("allergies=:allergies")
             params["allergies"] = json.dumps(req.allergies, ensure_ascii=False)
+        if req.rest_notify is not None:
+            fields.append("rest_notify=:rest_notify"); params["rest_notify"] = bool(req.rest_notify)
+            # Выключили — снимаем висящий отдых, иначе вибрация придёт уже после
+            # того, как человек от уведомлений отказался.
+            if not req.rest_notify:
+                _cancel_rest(user.id)
+        if req.rest_notify_offered:
+            # Предложение показано. Отметка ставится один раз и не сбрасывается:
+            # отказавшийся однажды не должен видеть его снова.
+            fields.append("rest_notify_offered_at=COALESCE(rest_notify_offered_at, :offered_now)")
+            params["offered_now"] = datetime.utcnow()
         # Если заполнены ключевые поля — ставим profile_complete=TRUE
         user_row = db.execute(text("SELECT age, weight, height FROM users WHERE id=:uid"), {"uid": user.id}).fetchone()
         age_val = req.age if req.age is not None else (user_row.age if user_row else None)
@@ -2139,11 +2157,28 @@ class LogSetRequest(BaseModel):
     duration_sec: Optional[int] = None
     distance_km: Optional[float] = None
     rpe: Optional[int] = None
+    # Сколько секунд отдыхать после этого подхода. Отсчёт ведёт сервер, а не
+    # приложение: таймер в webview вставал, стоило заблокировать телефон.
+    rest_sec: Optional[int] = None
+
+
+# Короче полуминуты уведомление не шлём: за такое время телефон всё равно
+# не успеешь убрать. Порог именно 30, а не 60: персональная пауза считается по
+# истории человека и законно бывает 30 или 45 секунд — на пороге в минуту у тех,
+# кто отдыхает мало, фича молча не работала бы вообще.
+REST_NOTIFY_MIN_SEC = 30
+# Верхняя граница — защита от мусора в теле запроса: без неё огромное значение
+# даёт OverflowError при сложении дат и 500 вместо записанного подхода.
+REST_NOTIFY_MAX_SEC = 1800
+
 
 @app.post("/api/workout/{workout_id}/set", dependencies=[Depends(verify_tg_user)])
 def log_set(workout_id: int, req: LogSetRequest, tg_id: int):
     with SessionLocal() as db:
-        user = db.execute(text("SELECT id FROM users WHERE telegram_id=:tg_id"), {"tg_id": tg_id}).fetchone()
+        user = db.execute(text("""
+            SELECT id, COALESCE(rest_notify, FALSE) AS rest_notify
+            FROM users WHERE telegram_id=:tg_id
+        """), {"tg_id": tg_id}).fetchone()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
         volume_add = (req.weight or 0) * (req.reps or 1)
@@ -2156,8 +2191,70 @@ def log_set(workout_id: int, req: LogSetRequest, tg_id: int):
         db.execute(text("""
             UPDATE workouts SET total_volume = COALESCE(total_volume,0) + :vol WHERE id=:wid
         """), {"vol": volume_add, "wid": workout_id})
+
+        # Запускаем отдых. Строка одна на человека, следующий подход её заменяет —
+        # поэтому старое уведомление не «догонит» уже начатое упражнение.
+        _rest_sec = min(int(req.rest_sec), REST_NOTIFY_MAX_SEC) if req.rest_sec else 0
+        if user.rest_notify and _rest_sec >= REST_NOTIFY_MIN_SEC:
+            db.execute(text("""
+                INSERT INTO active_rest
+                  (user_id, workout_id, exercise_name, set_number, ends_at,
+                   notified, cancelled, message_id, created_at)
+                VALUES (:uid, :wid, :ename, :snum, :ends, FALSE, FALSE, NULL, :now)
+                ON CONFLICT (user_id) DO UPDATE SET
+                  workout_id = EXCLUDED.workout_id,
+                  exercise_name = EXCLUDED.exercise_name,
+                  set_number = EXCLUDED.set_number,
+                  ends_at = EXCLUDED.ends_at,
+                  notified = FALSE,
+                  -- Снимаем пометку отмены: человек продолжил тренировку, и это
+                  -- уже новый отдых. Без сброса строка осталась бы отменённой
+                  -- и не прозвонила бы никогда.
+                  cancelled = FALSE,
+                  created_at = EXCLUDED.created_at
+                  -- message_id НЕ трогаем: он нужен, чтобы при следующей
+                  -- отправке удалить предыдущее уведомление из чата
+            """), {"uid": user.id, "wid": workout_id, "ename": req.exercise_name[:200],
+                   "snum": req.set_number,
+                   # Время считаем в Python и в UTC — бот сравнивает так же.
+                   # Через NOW() в базе значение зависело бы от таймзоны сессии.
+                   "now": datetime.utcnow(),
+                   "ends": datetime.utcnow() + timedelta(seconds=_rest_sec)})
         db.commit()
         return {"ok": True}
+
+
+def _cancel_rest(user_id: int):
+    """Снять текущий отдых: завершили тренировку, пропустили отдых, выключили сигнал.
+
+    Строку НЕ удаляем, а помечаем. Удалить сообщение из Telegram может только
+    бот, а id сообщения живёт в этой строке — удалив её здесь, мы оставили бы
+    последнее уведомление каждой тренировки висеть в чате навсегда. Бот увидит
+    пометку, снимет сообщение и уберёт строку.
+
+    Своя транзакция: раньше функция работала в сессии вызывающего и при ошибке
+    делала rollback, откатывая заодно завершение тренировки.
+    """
+    try:
+        with SessionLocal() as _db:
+            _db.execute(text("""
+                UPDATE active_rest SET cancelled = TRUE, notified = TRUE
+                WHERE user_id = :uid
+            """), {"uid": user_id})
+            _db.commit()
+    except Exception as e:
+        logger.warning(f"[отдых] не удалось снять: {e}")
+
+
+@app.post("/api/workout/{tg_id}/rest/cancel", dependencies=[Depends(verify_tg_user)])
+def cancel_rest(tg_id: int):
+    """Отдых прерван: человек нажал «пропустить» или начал следующий подход."""
+    with SessionLocal() as db:
+        user = db.execute(text("SELECT id FROM users WHERE telegram_id=:tg_id"), {"tg_id": tg_id}).fetchone()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        _cancel_rest(user.id)
+    return {"ok": True}
 
 
 class FinishWorkoutRequest(BaseModel):
@@ -2177,6 +2274,9 @@ def finish_workout(workout_id: int, req: FinishWorkoutRequest, tg_id: int):
             UPDATE workouts SET status='finished', duration_minutes=:dur, calories_burned=:cal
             WHERE id=:wid AND user_id=:uid
         """), {"dur": dur, "cal": calories_burned, "wid": workout_id, "uid": user.id})
+        # Тренировка окончена — висящий отдых больше не нужен, иначе человек
+        # получит вибрацию уже по дороге домой.
+        _cancel_rest(user.id)
         add_points(db, user.id, 10, "workout_finished")
         streak_days = calculate_streak(db, user.id)
         new_streak_rewards = check_streak_rewards(db, user.id, streak_days)
@@ -3685,6 +3785,7 @@ _USER_TABLES_ORDER = [
     "custom_exercises",
     "ai_chat_history",
     "ai_usage_log",
+    "active_rest",
     "points_log",
     "user_achievements",
     "user_supplements",
