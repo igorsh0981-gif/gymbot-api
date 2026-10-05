@@ -27,7 +27,17 @@ if DATABASE_URL.startswith("postgres://"):
 elif DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+pg8000://", 1)
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=280)
+# Пул соединений. По умолчанию SQLAlchemy держит 5 плюс 10 сверх лимита, а рабочих
+# потоков у FastAPI сорок — на всплеске потоки встают в очередь за соединением,
+# и это ожидание не видно ни в одном замере самих запросов.
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    pool_recycle=280,
+    pool_size=20,
+    max_overflow=10,
+    pool_timeout=10,     # лучше быстрая ошибка, чем тридцать секунд немого ожидания
+)
 SessionLocal = sessionmaker(bind=engine)
 
 # ── Счётчик запросов к базе на один HTTP-запрос ─────────────────────
@@ -37,6 +47,10 @@ import contextvars as _cv
 from sqlalchemy import event as _sa_event
 
 _db_calls = _cv.ContextVar("db_calls", default=None)
+# Момент прихода HTTP-запроса. Нужен, чтобы отличить «долго работали» от
+# «долго ждали свободный поток»: во втором случае ни один замер внутри
+# обработчика ничего не покажет, время уходит ДО его начала.
+_req_t0 = _cv.ContextVar("req_t0", default=None)
 
 
 @_sa_event.listens_for(engine, "before_cursor_execute")
@@ -305,19 +319,24 @@ async def _timing_middleware(request: FastAPIRequest, call_next):
     box = [0, 0.0]            # [сколько запросов, сколько секунд в сумме]
     token = _db_calls.set(box)
     t0 = time.time()
+    token_t = _req_t0.set(t0)
     try:
         response = await call_next(request)
     finally:
         _db_calls.reset(token)
+        _req_t0.reset(token_t)
     total = time.time() - t0
     if total >= SLOW_REQUEST_SEC:
-        path = request.url.path
         n, db_sec = box
-        other = total - db_sec
+        try:
+            pool = engine.pool.status()
+        except Exception:
+            pool = "?"
         logger.info(
-            f"[медленно] {request.method} {path} — {total:.1f}с | "
-            f"база: {n} запрос(ов) за {db_sec:.1f}с | остальное {other:.1f}с"
+            f"[медленно] {request.method} {request.url.path} — {total:.1f}с | "
+            f"база: {n} запрос(ов) за {db_sec:.1f}с | вне базы {total - db_sec:.1f}с"
             + (f" | на запрос ~{db_sec / n * 1000:.0f}мс" if n else "")
+            + f" | пул: {pool}"
         )
     return response
 
@@ -608,6 +627,10 @@ def _ai_core(req: "AIRequest", x_telegram_init_data: Optional[str] = None, strea
     """
     import time as _t
     _t0 = _t.time()   # замер: где уходит время — в базе или у Anthropic
+    # Сколько запрос пролежал в очереди, прежде чем ему достался рабочий поток.
+    # Запросы к базе идут по 15 мс, а сборка контекста показывала 11 секунд —
+    # значит поток почти всё это время просто не выполнялся. Вот эта цифра.
+    _t_queued = _t0 - (_req_t0.get() or _t0)
     if not ANTHROPIC_API_KEY:
         raise HTTPException(status_code=503, detail="AI not configured")
 
@@ -1340,7 +1363,8 @@ def _ai_core(req: "AIRequest", x_telegram_init_data: Optional[str] = None, strea
         # именно что записывались в кэш.
         _cache_w = getattr(_u, "cache_creation_input_tokens", 0) or 0
         logger.info(
-            f"[ai timing] контекст из базы {(_t_ctx - _t0):.1f}с | "
+            f"[ai timing] ожидание потока {_t_queued:.1f}с | "
+            f"контекст из базы {(_t_ctx - _t0):.1f}с | "
             f"ответ Anthropic {(_t_api - _t_ctx):.1f}с | "
             f"токены вход {_in}, в кэш записано {_cache_w}, из кэша прочитано {_cache}, "
             f"выход {_out} | схема {'да' if 'output_config' in _kw else 'нет'}"
