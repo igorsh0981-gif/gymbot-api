@@ -3,7 +3,7 @@ api.py — REST API для GymBot Mini App (Telegram WebApp)
 Запуск: uvicorn api:app --host 0.0.0.0 --port 8081
 pip: fastapi uvicorn sqlalchemy pg8000 python-dotenv httpx anthropic python-multipart
 """
-import os, logging
+import os, logging, time
 from datetime import datetime, timedelta
 from typing import Optional, List
 from decimal import Decimal
@@ -29,6 +29,28 @@ elif DATABASE_URL.startswith("postgresql://"):
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=280)
 SessionLocal = sessionmaker(bind=engine)
+
+# ── Счётчик запросов к базе на один HTTP-запрос ─────────────────────
+# Нужен, чтобы не гадать, почему экран грузится долго: в логе сразу видно,
+# сколько обращений к базе стоил запрос и сколько из общего времени ушло на них.
+import contextvars as _cv
+from sqlalchemy import event as _sa_event
+
+_db_calls = _cv.ContextVar("db_calls", default=None)
+
+
+@_sa_event.listens_for(engine, "before_cursor_execute")
+def _db_before(conn, cursor, statement, parameters, context, executemany):
+    context._t_started = time.time()
+
+
+@_sa_event.listens_for(engine, "after_cursor_execute")
+def _db_after(conn, cursor, statement, parameters, context, executemany):
+    box = _db_calls.get()
+    if box is None:
+        return
+    box[0] += 1
+    box[1] += time.time() - getattr(context, "_t_started", time.time())
 
 R2_PUBLIC_URL = os.getenv("R2_PUBLIC_URL", "").rstrip("/")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
@@ -264,6 +286,41 @@ app.add_middleware(
     allow_credentials=False,
     max_age=3600,
 )
+
+
+# Порог, выше которого запрос попадает в лог как медленный. Ноль — логировать всё.
+SLOW_REQUEST_SEC = float(os.getenv("SLOW_REQUEST_SEC", "0.7"))
+
+
+@app.middleware("http")
+async def _timing_middleware(request: FastAPIRequest, call_next):
+    """Сколько заняла обработка и сколько из этого ушло на базу.
+
+    Без этого о медленных экранах можно было только догадываться: в логе видно
+    лишь «200 OK». Теперь строка сразу говорит, где время — в количестве
+    обращений к базе, в их стоимости, или вообще не в базе.
+    """
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    box = [0, 0.0]            # [сколько запросов, сколько секунд в сумме]
+    token = _db_calls.set(box)
+    t0 = time.time()
+    try:
+        response = await call_next(request)
+    finally:
+        _db_calls.reset(token)
+    total = time.time() - t0
+    if total >= SLOW_REQUEST_SEC:
+        path = request.url.path
+        n, db_sec = box
+        other = total - db_sec
+        logger.info(
+            f"[медленно] {request.method} {path} — {total:.1f}с | "
+            f"база: {n} запрос(ов) за {db_sec:.1f}с | остальное {other:.1f}с"
+            + (f" | на запрос ~{db_sec / n * 1000:.0f}мс" if n else "")
+        )
+    return response
+
 
 @app.get("/api/health")
 def health():
@@ -2859,12 +2916,17 @@ def _build_split_options(db, user_id: int, split_type: str) -> list:
 def _pick_exercises_for_groups(db, user_id: int, group_ids: list) -> list:
     """Состав тренировки по группам мышц — из того, что человек реально делал.
 
-    До этого карточка на главном экране отдавала только группы мышц, и кнопка
-    «Начать тренировку» приводила на экран выбора упражнений: собирать тренировку
-    всё равно приходилось руками. Здесь состав подбирается на сервере.
+    Карточка на главном экране отдавала только группы мышц, и «Начать тренировку»
+    приводило на экран выбора: собирать тренировку всё равно приходилось руками.
+    Здесь состав подбирается на сервере.
 
-    Приоритет: сначала собственная история по этой группе (чаще делал и делал
-    недавно — выше), затем база каталога, если по группе истории нет.
+    Приоритет внутри группы: первым идёт движение с наибольшим рабочим весом —
+    на практике это и есть базовое (жим, тяга, присед). Остальные добираются по
+    частоте. Нет истории по группе — доливаем базой каталога.
+
+    ДВА запроса на весь подбор, а не два на каждую группу. Прежний вариант с
+    циклом добавлял до шести обращений к базе прямо в загрузку главного экрана,
+    и на медленном соединении с базой это были лишние секунды ожидания.
     """
     if not group_ids:
         return []
@@ -2874,82 +2936,82 @@ def _pick_exercises_for_groups(db, user_id: int, group_ids: list) -> list:
     # Одна группа — 5 упражнений, две — по 3, больше — по 2.
     # Те же границы, что в правилах для AI: одна группа максимум 5, вместе максимум 6.
     per_group = 5 if len(gids) == 1 else (3 if len(gids) == 2 else 2)
-    picked: list = []
+    gid_list = ",".join(str(g) for g in gids)
+    take = per_group + 3          # запас, чтобы было из чего выбирать базовое
 
+    by_group: dict = {}
+    try:
+        # Своя история по ВСЕМ группам сразу. Сопоставление и по exercise_id, и по
+        # названию — часть старых подходов записана без id и ловится только по имени.
+        rows = db.execute(text(f"""
+            SELECT e.muscle_group_id AS gid,
+                   e.id AS eid,
+                   COUNT(DISTINCT w.id) AS sessions,
+                   MAX(w.date) AS last_d,
+                   COALESCE(MAX(ws.weight), 0) AS max_w
+            FROM workout_sets ws
+            JOIN workouts w ON w.id = ws.workout_id
+            JOIN exercises e ON (e.id = ws.exercise_id
+                                 OR (ws.exercise_id IS NULL
+                                     AND LOWER(e.name) = LOWER(ws.exercise_name)))
+            WHERE w.user_id = :uid AND w.status = 'finished'
+              AND e.muscle_group_id IN ({gid_list})
+              AND w.date > CURRENT_DATE - INTERVAL '180 days'
+            GROUP BY e.muscle_group_id, e.id
+            ORDER BY sessions DESC, last_d DESC
+        """), {"uid": user_id}).fetchall()
+        for r in rows:
+            by_group.setdefault(r.gid, [])
+            if len(by_group[r.gid]) < take:
+                by_group[r.gid].append(r)
+    except Exception as e:
+        # Без rollback сессия остаётся в аборченной транзакции, и следующий же
+        # запрос в get_home падает — вместо карточки без состава человек получал
+        # бы 500 и пустой главный экран.
+        logger.warning(f"[подбор] история недоступна: {e}")
+        try: db.rollback()
+        except Exception: pass
+
+    chosen: dict = {}
+    need_fill = []
     for gid in gids:
-        rows = []
+        cand = by_group.get(gid, [])
+        if cand:
+            heavy = max(cand, key=lambda r: (float(r.max_w or 0), r.sessions))
+            rest = [r for r in cand if r.eid != heavy.eid][: per_group - 1]
+            chosen[gid] = [heavy.eid] + [r.eid for r in rest]
+        else:
+            chosen[gid] = []
+        if len(chosen[gid]) < per_group:
+            need_fill.append(gid)
+
+    # Добор из каталога — тоже одним запросом на все недобранные группы.
+    if need_fill:
         try:
-            # Своя история: число тренировок с этим упражнением и дата последней.
-            # Сопоставление и по exercise_id, и по названию — часть старых подходов
-            # записана без id и привязывается только по имени.
-            # Берём с запасом: ниже первым слотом ставится базовое движение,
-            # а не самое частое. Отбор только по частоте давал день ног из
-            # подъёмов на носки, сгибаний и сведения — без единого базового.
-            rows = db.execute(text(f"""
-                SELECT e.id,
-                       COUNT(DISTINCT w.id) AS sessions,
-                       MAX(w.date) AS last_d,
-                       COALESCE(MAX(ws.weight), 0) AS max_w
-                FROM workout_sets ws
-                JOIN workouts w ON w.id = ws.workout_id
-                JOIN exercises e ON (e.id = ws.exercise_id
-                                     OR (ws.exercise_id IS NULL
-                                         AND LOWER(e.name) = LOWER(ws.exercise_name)))
-                WHERE w.user_id = :uid AND w.status = 'finished'
-                  AND e.muscle_group_id = {int(gid)}
-                  AND w.date > CURRENT_DATE - INTERVAL '180 days'
-                GROUP BY e.id
-                ORDER BY sessions DESC, last_d DESC
-                LIMIT {int(per_group) + 3}
-            """), {"uid": user_id}).fetchall()
-            if rows:
-                # Первым идёт движение с наибольшим рабочим весом в этой группе —
-                # на практике это и есть базовое (жим, тяга, присед). Остальные
-                # добираются по частоте, как раньше.
-                cand = list(rows)
-                heavy = max(cand, key=lambda r: (float(r[3] or 0), r[1]))
-                rest = [r for r in cand if r[0] != heavy[0]][: int(per_group) - 1]
-                rows = [heavy] + rest
+            taken = [e for v in chosen.values() for e in v]
+            skip = ",".join(str(int(i)) for i in taken) if taken else "0"
+            fill_list = ",".join(str(g) for g in need_fill)
+            extra = db.execute(text(f"""
+                SELECT muscle_group_id AS gid, id AS eid FROM exercises
+                WHERE muscle_group_id IN ({fill_list})
+                  AND id NOT IN ({skip})
+                ORDER BY muscle_group_id,
+                         CASE difficulty WHEN 'easy' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
+                         id
+            """)).fetchall()
+            for r in extra:
+                if len(chosen.get(r.gid, [])) < per_group:
+                    chosen.setdefault(r.gid, []).append(r.eid)
         except Exception as e:
-            # Без rollback сессия остаётся в аборченной транзакции, и следующий же
-            # запрос в get_home падает — вместо карточки без состава человек получал
-            # бы 500 и пустой главный экран.
-            logger.warning(f"[подбор] история по группе {gid} недоступна: {e}")
+            logger.warning(f"[подбор] каталог недоступен: {e}")
             try: db.rollback()
             except Exception: pass
 
-        ids = [r[0] for r in rows]
-
-        # Истории мало — доливаем базовыми упражнениями каталога на эту группу
-        if len(ids) < per_group:
-            try:
-                skip = ",".join(str(int(i)) for i in ids) if ids else "0"
-                extra = db.execute(text(f"""
-                    SELECT id FROM exercises
-                    WHERE muscle_group_id = {int(gid)}
-                      AND id NOT IN ({skip})
-                    ORDER BY CASE difficulty
-                                 WHEN 'easy' THEN 0
-                                 WHEN 'medium' THEN 1
-                                 ELSE 2 END,
-                             id
-                    LIMIT {int(per_group - len(ids))}
-                """)).fetchall()
-                ids += [r[0] for r in extra]
-            except Exception as e:
-                logger.warning(f"[подбор] каталог по группе {gid} недоступен: {e}")
-                try: db.rollback()
-                except Exception: pass
-
-        picked.extend(ids)
-
-    # Порядок не должен зависеть от порядка групп в сплите: крупные группы вперёд.
-    # Дубли возможны, если одно упражнение числится в двух группах.
+    # Порядок групп — как в сплите. Дубли возможны, если упражнение числится в двух.
+    picked = [e for gid in gids for e in chosen.get(gid, [])]
     seen = set()
     uniq = [i for i in picked if not (i in seen or seen.add(i))]
-    if len(uniq) > 6:
-        uniq = uniq[:6]   # тот же лимит, что в правилах для AI: максимум 6 на тренировку
-    return uniq
+    return uniq[:6]   # тот же лимит, что в правилах для AI: максимум 6 на тренировку
 
 
 def _rec_description(db, user_id: int, option: dict, week: dict) -> str:
