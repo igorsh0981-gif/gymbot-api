@@ -483,8 +483,82 @@ def get_stats(tg_id: int, days: int = 30):
             "weight_logs": [{"weight": float(w.weight), "logged_at": w.logged_at.isoformat()} for w in weight_logs],
         }
 
+#: Языки, для которых в базе есть колонки с переводами. Подставляется в имя
+#: колонки, поэтому список закрытый: имя колонки нельзя передать параметром
+#: ни в одном драйвере, а пускать в SQL строку от клиента нельзя.
+EXERCISE_LANGS = ("en", "uz", "kz")
+
+#: Телеграм отдаёт код казахского как kk (так в стандарте), а у нас в базе
+#: колонки и users.lang — kz. Фронтенд приводит код сам, но принимать оба
+#: дешевле, чем однажды молча отдать русский вместо казахского.
+LANG_ALIASES = {"kk": "kz", "kaz": "kz"}
+
+#: Набор пробельных символов для BTRIM. Нужен именно он, а не простой TRIM:
+#: в Postgres TRIM(x) срезает ТОЛЬКО пробелы, поэтому перевод из одних
+#: переводов строки прошёл бы проверку на пустоту — и человек увидел бы
+#: карточку «ОПИСАНИЕ» с пустым телом вместо русского текста.
+#: Проверено на Postgres: TRIM(E'\n\n') возвращает E'\n\n', BTRIM с этим
+#: набором — пустую строку.   здесь не для красоты: админка принимает
+#: вставку из Word и Google Docs, а там неразрывный пробел — обычное дело.
+_WS_CHARS = r"E' \t\r\n '"
+
+
+def _norm_lang(lang: Optional[str], default: str = "ru") -> str:
+    """Любой код языка → один из наших четырёх (ru/en/uz/kz).
+
+    Один нормализатор на весь файл, чтобы каталог, экран плана и подсказка
+    языка для AI не разъехались: в users.lang пишет PUT /api/user без всякой
+    проверки, так что туда может попасть и "UZ", и "kk", и "uz-UZ".
+    """
+    if not lang:
+        return default
+    # Отрезаем регион: приходит и "uz", и "uz-UZ", и "kk_KZ".
+    code = str(lang).strip().lower().replace("_", "-").split("-")[0]
+    code = LANG_ALIASES.get(code, code)
+    return code if code in ("ru",) + EXERCISE_LANGS else default
+
+
+def _exercise_lang(lang: Optional[str]) -> Optional[str]:
+    """Код языка → суффикс колонки с переводом, либо None для русского.
+
+    Единственное место, где строка от клиента превращается в часть имени
+    колонки. Наружу выходит только элемент EXERCISE_LANGS или None, поэтому
+    подставлять результат в SQL безопасно. Менять — только вместе с этой
+    гарантией: ниже результат идёт в f-string, а не в параметр запроса.
+    """
+    code = _norm_lang(lang)
+    return code if code in EXERCISE_LANGS else None
+
+
 @app.get("/api/exercises")
-def get_exercises(group_id: Optional[int] = None, search: Optional[str] = None):
+def get_exercises(group_id: Optional[int] = None, search: Optional[str] = None,
+                  lang: Optional[str] = None):
+    """Каталог упражнений. Описание и технику отдаём сразу на языке приложения.
+
+    Почему язык выбирает сервер, а не фронтенд. Переводы можно было бы сложить
+    в ответ все сразу, как сделано с названиями, и выбирать на клиенте. Но
+    название — это строка, а техника — несколько абзацев: по текстам из
+    new_exercises_translations.txt описание выходит около 90 символов, а
+    техника около 1200. На двести упражнений это примерно 400 КБ на один язык
+    и под 1,7 МБ на все четыре, из которых человек прочитает четверть.
+    На мобильной сети это заметно, а каталог грузится при каждом запуске
+    приложения. Поэтому отдаём один язык — тот, о котором попросили.
+
+    Если перевода нет (или он пустая строка), отдаём русский. Для пользователя
+    это ровно то, что он видел до этой правки, так что хуже не станет нигде.
+    """
+    sfx = _exercise_lang(lang)
+    if sfx:
+        # BTRIM внутри NULLIF, а не просто NULLIF(..., ''): админка пишет поле
+        # как `description_uz or None`, поэтому перевод из одних пробелов или
+        # переводов строки доезжает до базы непустым. Без обрезки он прошёл бы
+        # проверку, и человек увидел бы карточку «ОПИСАНИЕ» с пустым телом
+        # вместо русского текста.
+        desc_col = f"COALESCE(NULLIF(BTRIM(e.description_{sfx}, {_WS_CHARS}), ''), e.description) AS description"
+        tech_col = f"COALESCE(NULLIF(BTRIM(e.technique_{sfx}, {_WS_CHARS}), ''), e.technique) AS technique"
+    else:
+        desc_col = "e.description"
+        tech_col = "e.technique"
     with SessionLocal() as db:
         where = "WHERE 1=1"
         params = {}
@@ -495,13 +569,11 @@ def get_exercises(group_id: Optional[int] = None, search: Optional[str] = None):
             where += " AND LOWER(e.name) LIKE :q"
             params["q"] = f"%{search.lower()}%"
         exercises = db.execute(text(f"""
-            SELECT e.id, e.name, e.description, e.technique, e.difficulty, e.equipment,
+            SELECT e.id, e.name, {desc_col}, {tech_col}, e.difficulty, e.equipment,
                    e.sets_recommended, e.reps_recommended, e.muscle_group_id, e.r2_slug, e.video_ext,
                    mg.name as group_name, mg.emoji as group_emoji, mg.icon_ext as group_icon_ext,
                    COALESCE(e.exercise_type, 'strength') as exercise_type,
                    e.name_en, e.name_uz, e.name_kz,
-                   e.description_en, e.description_uz, e.description_kz,
-                   e.technique_en, e.technique_uz, e.technique_kz,
                    mg.name_en as group_name_en, mg.name_uz as group_name_uz, mg.name_kz as group_name_kz
             FROM exercises e JOIN muscle_groups mg ON mg.id = e.muscle_group_id
             {where} ORDER BY mg.id, e.name LIMIT 200
@@ -1019,8 +1091,17 @@ def _ai_core(req: "AIRequest", x_telegram_init_data: Optional[str] = None, strea
         _tm["питание"] = _t.time() - _tprev; _tprev = _t.time()
 
     # ── Шаг 2: вызываем Anthropic API ВНЕ транзакции БД ─────────────────────
-    lang = (user.lang if user else None) or "ru"
-    lang_hint = "Reply in Russian." if lang == "ru" else ("Reply in Uzbek." if lang == "uz" else "Reply in English.")
+    # Казахского здесь не было вовсе: ветка else отправляла пользователя с
+    # lang="kz" в английский. Интерфейс по-казахски, тренер по-английски.
+    # Через тот же _norm_lang, что и каталог, иначе при "uz-UZ" в базе каталог
+    # станет узбекским, а тренер ответит по-английски.
+    lang = _norm_lang(user.lang if user else None)
+    lang_hint = {
+        "ru": "Reply in Russian.",
+        "uz": "Reply in Uzbek.",
+        "kz": "Reply in Kazakh.",
+        "en": "Reply in English.",
+    }.get(lang, "Reply in Russian.")
     # Тон общения AI — из профиля или по возрасту
     tone_prompt = ""
     try:
@@ -2417,9 +2498,20 @@ def finish_workout(workout_id: int, req: FinishWorkoutRequest, tg_id: int):
 @app.get("/api/planned/{tg_id}/{workout_id}", dependencies=[Depends(verify_tg_user)])
 def get_planned_detail(tg_id: int, workout_id: int):
     with SessionLocal() as db:
-        user = db.execute(text("SELECT id FROM users WHERE telegram_id=:tg_id"), {"tg_id": tg_id}).fetchone()
+        user = db.execute(text("SELECT id, lang FROM users WHERE telegram_id=:tg_id"), {"tg_id": tg_id}).fetchone()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
+        # Здесь, в отличие от каталога, язык спрашивать у клиента не нужно:
+        # эндпоинт и так знает пользователя. Экран запланированной тренировки
+        # давно зовёт tField/tGroup, но сервер отдавал только русские поля —
+        # и для узбекского пользователя экран оставался целиком русским.
+        sfx = _exercise_lang(getattr(user, "lang", None))
+        if sfx:
+            e_name_col = f"COALESCE(NULLIF(BTRIM(e.name_{sfx}, {_WS_CHARS}), ''), e.name) AS e_name"
+            e_desc_col = f"COALESCE(NULLIF(BTRIM(e.description_{sfx}, {_WS_CHARS}), ''), e.description) AS e_desc"
+            mg_name_col = f"COALESCE(NULLIF(BTRIM(mg.name_{sfx}, {_WS_CHARS}), ''), mg.name) AS mg_name"
+        else:
+            e_name_col, e_desc_col, mg_name_col = "e.name AS e_name", "e.description AS e_desc", "mg.name AS mg_name"
         pw = db.execute(text("""
             SELECT id AS pw_id, planned_datetime AS pw_dt, title AS pw_title,
                    status AS pw_status, exercises_ids AS pw_exids, exercise_tips AS pw_tips
@@ -2434,11 +2526,11 @@ def get_planned_detail(tg_id: int, workout_id: int):
             placeholders = ",".join([f":eid{i}" for i in range(len(ex_ids))])
             eid_params = {f"eid{i}": v for i, v in enumerate(ex_ids)}
             rows = db.execute(text(f"""
-                SELECT e.id AS e_id, e.name AS e_name, e.sets_recommended AS e_sets,
+                SELECT e.id AS e_id, {e_name_col}, e.sets_recommended AS e_sets,
                        e.reps_recommended AS e_reps, e.difficulty AS e_diff,
-                       e.equipment AS e_equip, e.description AS e_desc,
+                       e.equipment AS e_equip, {e_desc_col},
                        e.muscle_group_id AS e_mgid,
-                       mg.name AS mg_name, mg.emoji AS mg_emoji, mg.icon_ext AS mg_icon_ext
+                       {mg_name_col}, mg.emoji AS mg_emoji, mg.icon_ext AS mg_icon_ext
                 FROM exercises e
                 LEFT JOIN muscle_groups mg ON mg.id = e.muscle_group_id
                 WHERE e.id IN ({placeholders})
