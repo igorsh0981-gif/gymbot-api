@@ -3104,6 +3104,39 @@ SPLIT_SYSTEMS = {
     ]},
 }
 
+#: Переводы названий сплитов. Отдельной таблицей, а не колонками в базе:
+#: сплиты это не данные, а шесть зашитых в код систем, и заводить под них
+#: миграцию не за чем. Ключ — тот же код сплита, что в users.split_type.
+SPLIT_NAMES = {
+    "auto":           {"en": "Custom",       "uz": "Erkin",           "kz": "Еркін"},
+    "fullbody":       {"en": "Full body",    "uz": "Full body",       "kz": "Фулбоди"},
+    "upper_lower":    {"en": "Upper / lower","uz": "Yuqori / pastki", "kz": "Жоғарғы / төменгі"},
+    "push_pull_legs": {"en": "Push / pull / legs",
+                       "uz": "Bosish / tortish / oyoq",
+                       "kz": "Итеру / тарту / аяқ"},
+    "four_day":       {"en": "Chest / back / legs / arms",
+                       "uz": "Ko‘krak / orqa / oyoq / qo‘l",
+                       "kz": "Кеуде / арқа / аяқ / қол"},
+    "antagonist":     {"en": "Back-biceps / chest-triceps / legs-shoulders",
+                       "uz": "Orqa-biseps / ko‘krak-triseps / oyoq-yelka",
+                       "kz": "Арқа-бицепс / кеуде-трицепс / аяқ-иық"},
+}
+
+
+def split_name(key: str, lang: Optional[str]) -> str:
+    """Название сплита на языке пользователя, с откатом на русский."""
+    # Ключ разрешаем ДО поиска перевода. Иначе легаси-значение в users.split_type
+    # откатывалось на «auto» для русского названия, а перевод искался по старому
+    # ключу, не находился — и узбеку приезжало русское «Произвольный».
+    resolved = key if key in SPLIT_SYSTEMS else "auto"
+    code = _norm_lang(lang)
+    if code != "ru":
+        tr = SPLIT_NAMES.get(resolved, {}).get(code)
+        if tr:
+            return tr
+    return SPLIT_SYSTEMS[resolved]["name"]
+
+
 # Кардио не участвует в подборе силового сплита
 _NON_STRENGTH_GROUPS = {"Кардио"}
 
@@ -3646,7 +3679,7 @@ def get_home_alternatives(tg_id: int):
     """Варианты замены предложенной тренировки + что уже отработано на неделе."""
     with SessionLocal() as db:
         user = db.execute(text("""
-            SELECT id, split_type, target_workouts_per_week FROM users WHERE telegram_id = :tg
+            SELECT id, split_type, target_workouts_per_week, lang FROM users WHERE telegram_id = :tg
         """), {"tg": tg_id}).fetchone()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
@@ -3676,7 +3709,8 @@ def get_home_alternatives(tg_id: int):
             "available": available,
             "recently_trained": done,
             "split_type": user.split_type or "auto",
-            "split_name": SPLIT_SYSTEMS.get(user.split_type or "auto", SPLIT_SYSTEMS["auto"])["name"],
+            # Язык берём из профиля: эндпоинт и так знает пользователя.
+            "split_name": split_name(user.split_type or "auto", getattr(user, "lang", None)),
             "week": week,
         }
 
@@ -3705,10 +3739,16 @@ def compose_workout(tg_id: int, group_ids: str = ""):
 
 
 @app.get("/api/splits")
-def list_splits():
-    """Справочник систем сплита для экрана настроек."""
+def list_splits(lang: Optional[str] = None):
+    """Справочник систем сплита для экрана настроек.
+
+    Язык спрашиваем параметром, как у каталога: эндпоинт публичный, без tg_id,
+    и пользователя не знает. Язык входит в адрес, поэтому и в ключ кэша на
+    фронте — переключение туда и обратно бесплатно.
+    """
     return {"splits": [
-        {"key": k, "name": v["name"], "days": len(v["blocks"]) if v["blocks"] else None}
+        {"key": k, "name": split_name(k, lang),
+         "days": len(v["blocks"]) if v["blocks"] else None}
         for k, v in SPLIT_SYSTEMS.items()
     ]}
 
