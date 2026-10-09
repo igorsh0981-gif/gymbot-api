@@ -40,6 +40,57 @@ engine = create_engine(
 )
 SessionLocal = sessionmaker(bind=engine)
 
+# ── Местное время ────────────────────────────────────────────────────
+#: Все колонки времени в базе — наивный UTC. Пользователи в Узбекистане и
+#: Казахстане, у обеих стран UTC+5 круглый год, перевода часов нет. Сдвиг уже
+#: был прописан числом в паре мест (планирование тренировки, сохранение даты) —
+#: здесь он получает имя, чтобы не разъезжался дальше.
+APP_TZ_OFFSET = timedelta(hours=5)
+
+
+def _local_now():
+    """Текущий момент по местному времени пользователя."""
+    return datetime.utcnow() + APP_TZ_OFFSET
+
+
+def _local_date(dt):
+    """Наивный UTC из базы → календарная дата, как её видит пользователь.
+
+    Принимает и datetime, и date: занятия спортом хранятся датой без времени,
+    силовые тренировки — отметкой времени. Без приведения к одному виду их
+    нельзя разложить в одну хронологию.
+    """
+    if dt is None:
+        return None
+    if isinstance(dt, datetime):
+        return (dt + APP_TZ_OFFSET).date()
+    return dt
+
+
+def _day_label(d, today=None):
+    """Дата + сколько дней назад, словами.
+
+    Модели нельзя оставлять арифметику по датам: в контексте лежали голые
+    отметки времени, и «сегодня / вчера / через день» она достраивала сама —
+    путала порядок событий и выдавала тренировки завтрашним числом.
+    """
+    if d is None:
+        return "date unknown"
+    today = today or _local_now().date()
+    gap = (today - d).days
+    # Метки по-английски: весь системный промпт английский, а при ответе на
+    # узбекском модель вставляла русское «СЕГОДНЯ» прямо в узбекский текст.
+    if gap == 0:
+        word = "TODAY"
+    elif gap == 1:
+        word = "YESTERDAY"
+    elif gap < 0:
+        word = f"in {-gap}d (PLANNED, not done yet)"
+    else:
+        word = f"{gap}d ago"
+    return f"{d.isoformat()} ({word})"
+
+
 # ── Счётчик запросов к базе на один HTTP-запрос ─────────────────────
 # Нужен, чтобы не гадать, почему экран грузится долго: в логе сразу видно,
 # сколько обращений к базе стоил запрос и сколько из общего времени ушло на них.
@@ -788,7 +839,7 @@ def _ai_core(req: "AIRequest", x_telegram_init_data: Optional[str] = None, strea
                     if last_ci.motivation_level:
                         ci_parts.append(f"motivation {last_ci.motivation_level}/5")
                     if ci_parts:
-                        days_ago = (datetime.utcnow() - last_ci.created_at).days if last_ci.created_at else 0
+                        days_ago = (_local_now().date() - _local_date(last_ci.created_at)).days if last_ci.created_at else 0
                         checkin_context = "\n\nLATEST CHECK-IN (" + str(days_ago) + "d ago): " + ', '.join(ci_parts) + ". Use this to personalize advice."
             except Exception:
                 try: db.rollback()
@@ -810,7 +861,7 @@ def _ai_core(req: "AIRequest", x_telegram_init_data: Optional[str] = None, strea
                         gstr = g[0]
                         if g[1]: gstr += f" (target: {g[1]} {g[2] or ''})"
                         if g[3]: gstr += f" (current: {g[3]})"
-                        if g[4]: gstr += f" (deadline: {g[4]})"
+                        if g[4]: gstr += f" (deadline: {_day_label(_local_date(g[4]))})"
                         if g[5]: gstr += " ✅ ACHIEVED"
                         g_parts.append(gstr)
                     goals_context = "\n\nUSER GOALS: " + "; ".join(g_parts) + ". Reference these goals in advice."
@@ -843,6 +894,7 @@ def _ai_core(req: "AIRequest", x_telegram_init_data: Optional[str] = None, strea
         # Спорт-активность за последние 30 дней
         _tm["цели+упражнения"] = _t.time() - _tprev; _tprev = _t.time()
         sport_context = ""
+        _sport_for_timeline = []   # те же записи понадобятся ниже, для общей ленты
         if user:
             try:
                 sport_rows = db.execute(text("""
@@ -865,9 +917,13 @@ def _ai_core(req: "AIRequest", x_telegram_init_data: Optional[str] = None, strea
                     ORDER BY session_date DESC LIMIT 10
                 """), {"uid": user.id}).fetchall()
                 if sport_detail:
+                    _sport_for_timeline = list(sport_detail)
                     detail_parts = []
                     for r in sport_detail:
-                        d = f"[{r[4]}] {SPORT_LABELS.get(r[0], r[0])}, {r[1]}мин, {r[2] or 'medium'}"
+                        # Дата с меткой «сколько дней назад», а не голая: раньше
+                        # здесь была дата без времени, а у силовых — отметка
+                        # времени, и модель раскладывала события в неверном порядке.
+                        d = f"[{_day_label(_local_date(r[4]))}] {SPORT_LABELS.get(r[0], r[0])}, {r[1]}мин, {r[2] or 'medium'}"
                         if r[3]: d += f", заметка: '{r[3]}'"
                         detail_parts.append(d)
                     sport_context += "\n\nSPORT SESSIONS DETAIL:\n" + "\n".join(detail_parts)
@@ -923,7 +979,7 @@ def _ai_core(req: "AIRequest", x_telegram_init_data: Optional[str] = None, strea
                             for n, v in ex_grouped.items()
                         )
                         total_sets = sum(len(v) for v in ex_grouped.values())
-                        wk_str = f"[{wk.date}] {wk.duration_minutes or 0}min, {wk.volume}kg, {total_sets} sets"
+                        wk_str = f"[{_day_label(_local_date(wk.date))}] {wk.duration_minutes or 0}min, {wk.volume}kg, {total_sets} sets"
                         if sets_str: wk_str += f" — {sets_str}"
                         wk_parts.append((wk_str, wk.ai_review, wk.date))
                     if wk_parts:
@@ -937,23 +993,102 @@ def _ai_core(req: "AIRequest", x_telegram_init_data: Optional[str] = None, strea
                         # Перерыв считаем здесь и отдаём числом. Раньше модель видела только
                         # даты в квадратных скобках и должна была вычитать их сама — делала это
                         # плохо, поэтому неделя простоя в разборе никак не отражалась.
-                        if len(wk_parts) > 1 and last_date and wk_parts[1][2]:
-                            # Считаем по календарным датам. Колонка date — DateTime,
-                            # и вычитание timestamp'ов округляется вниз: тренировка в
-                            # прошлый понедельник в 19:30 и сегодняшняя в 18:00 давали
-                            # 6 дней, порог «неделя» не срабатывал.
-                            _d1 = last_date.date() if hasattr(last_date, "date") else last_date
-                            _d0 = wk_parts[1][2].date() if hasattr(wk_parts[1][2], "date") else wk_parts[1][2]
-                            _gap = (_d1 - _d0).days
-                            last_str += f"\nDAYS SINCE PREVIOUS WORKOUT: {_gap}"
-                            if _gap >= 7:
+                        #
+                        # Теперь в счёт идут И занятия спортом. Раньше считалось только от
+                        # силовой до силовой, поэтому падел и футбол между ними были
+                        # невидимы — а модель всё равно рассуждала про «три дня подряд»
+                        # и попадала пальцем в небо, потому что угадывала.
+                        # Будущие даты отбрасываем: занятие спортом можно записать
+                        # наперёд, и запланированная на следующей неделе игра иначе
+                        # считалась бы проведённой — ломала и серию, и разрыв.
+                        _today_local = _local_now().date()
+                        _active_days = set()
+                        for _w in recent_wk:
+                            _d = _local_date(_w.date)
+                            if _d and _d <= _today_local: _active_days.add(_d)
+                        for _s in _sport_for_timeline:
+                            _d = _local_date(_s[4])
+                            if _d and _d <= _today_local: _active_days.add(_d)
+
+                        _last_day = _local_date(last_date)
+                        if _last_day:
+                            _earlier = [d for d in _active_days if d < _last_day]
+                            if _earlier:
+                                _gap = (_last_day - max(_earlier)).days
+                                last_str += f"\nDAYS SINCE PREVIOUS TRAINING OF ANY KIND (gym or sport): {_gap}"
+                                if _gap >= 7:
+                                    last_str += (
+                                        f" — THIS IS A {_gap}-DAY BREAK. You MUST mention the break explicitly "
+                                        "and account for it: do not expect progression over the pre-break numbers, "
+                                        "and for the next session start from the pre-break weights or lower, "
+                                        "not from an increase."
+                                    )
+                            # Простой ОТ СЕГОДНЯ — отдельное число. Предыдущее считает
+                            # зазор между двумя последними записями, и после долгого
+                            # перерыва оно равно единице: три дня подряд в начале
+                            # месяца и десять дней тишины давали «разрыв 1 день».
+                            _idle = (_today_local - _last_day).days
+                            last_str += f"\nDAYS SINCE LAST TRAINING, COUNTING FROM TODAY: {_idle}"
+                            if _idle >= 7:
                                 last_str += (
-                                    f" — THIS IS A {_gap}-DAY BREAK. You MUST mention the break explicitly "
-                                    "and account for it: do not expect progression over the pre-break numbers, "
-                                    "and for the next session start from the pre-break weights or lower, "
-                                    "not from an increase."
+                                    f" — THE CLIENT HAS NOT TRAINED FOR {_idle} DAYS. Address this break first; "
+                                    "do not expect progression and start the next session lighter."
                                 )
-                        workouts_context = "\n\nTODAY'S WORKOUT (most recent, analyze this specifically):\n" + last_str
+
+                            # Серия подряд идущих активных дней и плотность недели —
+                            # тоже числом, а не на откуп модели.
+                            _streak = 0
+                            _cur = _last_day
+                            while _cur in _active_days:
+                                _streak += 1
+                                _cur -= timedelta(days=1)
+                            # Нижняя граница у окна обязательна: у будущей даты
+                            # разность отрицательная, она тоже меньше семи, и
+                            # запланированное занятие попадало бы в «активные за неделю».
+                            _week = len([d for d in _active_days if 0 <= (_today_local - d).days < 7])
+                            last_str += (
+                                f"\nCONSECUTIVE ACTIVE DAYS ending on the last session: {_streak}"
+                                f"\nACTIVE DAYS IN THE LAST 7: {_week}"
+                            )
+                            # Предупреждение только если серия ещё идёт. Иначе человек
+                            # после десяти дней простоя слышал «ты тренируешься три дня
+                            # подряд, отдохни» — серия-то была, но месяц назад.
+                            if _streak >= 3 and _idle <= 1:
+                                last_str += (
+                                    f"\nWARNING: {_streak} days in a row with no rest day. Recovery is the limiting "
+                                    "factor here, say so and prescribe rest before the next hard session."
+                                )
+
+                        # Общая лента: зал и спорт в одном хронологическом списке.
+                        # До этого они лежали двумя отдельными блоками с разными
+                        # форматами дат, и склеивать их в одну картину приходилось
+                        # модели — она путала, что было раньше, падел или спина.
+                        #
+                        # Будущие даты сюда не берём вовсе: занятие спортом можно
+                        # записать наперёд (экран делит их на будущие и прошедшие),
+                        # и запланированный на следующей неделе падел оказывался
+                        # первой строкой ленты как уже состоявшийся.
+                        _tl = []
+                        for _w in recent_wk:
+                            _d = _local_date(_w.date)
+                            if _d and _d <= _today_local:
+                                _tl.append((_d, f"GYM: {_w.duration_minutes or 0}min, {_w.volume}kg"))
+                        for _s in _sport_for_timeline:
+                            _d = _local_date(_s[4])
+                            if _d and _d <= _today_local:
+                                _tl.append((_d, f"SPORT: {SPORT_LABELS.get(_s[0], _s[0])}, {_s[1] or 0}min, {_s[2] or 'medium'}"))
+                        _timeline_block = ""
+                        if _tl:
+                            _tl.sort(key=lambda x: x[0], reverse=True)
+                            _timeline_block = ("\n\nTRAINING TIMELINE (gym and sport merged, newest first — "
+                                               "this is the authoritative order of events):\n" +
+                                               "\n".join(f"{_day_label(d, _today_local)} — {txt}" for d, txt in _tl[:14]))
+
+                        # Лента — отдельный блок, а не хвост разбираемой тренировки:
+                        # внутри секции «analyze this specifically» четырнадцать строк
+                        # про другие дни читаются как часть этой же тренировки.
+                        workouts_context = ("\n\nLAST COMPLETED SESSION (analyze this specifically):\n"
+                                            + last_str + _timeline_block)
                         if len(wk_parts) > 1:
                             older_parts = []
                             for s, rev, _d in wk_parts[1:]:
@@ -973,7 +1108,7 @@ def _ai_core(req: "AIRequest", x_telegram_init_data: Optional[str] = None, strea
                 """), {"uid": user.id}).fetchall()
                 if prog:
                     workouts_context += "\n\nPROGRESS (90d max weights): " + "; ".join(
-                        f"{r.exercise_name} {r.max_w}kg ({r.sessions}x, {r.first_d}→{r.last_d})" for r in prog)
+                        f"{r.exercise_name} {r.max_w}kg ({r.sessions}x, {_day_label(_local_date(r.first_d))} → {_day_label(_local_date(r.last_d))})" for r in prog)
 
                 st = db.execute(text("""
                     SELECT COUNT(*) as total, ROUND(AVG(duration_minutes)) as avg_dur,
@@ -1056,7 +1191,7 @@ def _ai_core(req: "AIRequest", x_telegram_init_data: Optional[str] = None, strea
                     if meas.bicep: parts.append(f"bicep {meas.bicep}cm")
                     if meas.thigh: parts.append(f"thigh {meas.thigh}cm")
                     if parts:
-                        measurements_context = "\n\nBODY MEASUREMENTS (latest " + str(meas.measured_at)[:10] + "): " + ', '.join(parts) + "."
+                        measurements_context = "\n\nBODY MEASUREMENTS (" + _day_label(_local_date(meas.measured_at)) + "): " + ', '.join(parts) + "."
             except Exception:
                 try: db.rollback()
                 except: pass
@@ -1171,13 +1306,21 @@ def _ai_core(req: "AIRequest", x_telegram_init_data: Optional[str] = None, strea
             f"Never use section headers like 'Что хорошо / Что улучшить / Совет'. "
             f"Never follow a fixed template. Each answer should feel like a natural conversation. "
             f"Be specific — reference actual numbers from their data (sets, reps, weights, dates). "
+            # Без этой строки модель требовали называть даты и не говорили, какое
+            # сегодня число: «вчера», «через день», «три дня подряд» она сочиняла.
+            # Дата без времени намеренно: системный промпт кэшируется между
+            # запросами внутри диалога, а меняющиеся минуты сбрасывали бы кэш
+            # на каждом уточнении. Для тренировочных советов хватает дня недели.
+            f"TODAY IS {_local_now().strftime('%Y-%m-%d (%A)')}, client's local date (UTC+5). "
+            f"Every date in the data below is already labelled with how many days ago it was. "
+            f"Use those labels — never compute dates yourself, and never name a date that is not in the data. "
             f"Be honest — if something is off, say it directly. If progress is good, acknowledge it simply. "
             f"Keep it under 300 words unless the question genuinely needs more. "
             f"Use RPE/RIR naturally when relevant, not as a checklist item. "
             f"On progression: upper body isolation — +1-2kg per 2-4 weeks. "
             f"Compounds (bench/squat/deadlift/row) — +2.5kg per 1-2 weeks for intermediate, +1.25-2.5kg/month for advanced. "
             f"Suggest deload when client has trained hard 3+ weeks. "
-            f"CRITICAL: if TODAY'S WORKOUT section includes a trainer's note saying the NEXT session "
+            f"CRITICAL: if LAST COMPLETED SESSION includes a trainer's note saying the NEXT session "
             f"should be lighter/deload — this is a binding instruction, not just context. "
             f"If the client is now asking for a workout plan, that note applies to THIS plan. "
             f"Propose the deload/lighter session as instructed — do not propose a normal or heavy session "
@@ -1232,12 +1375,64 @@ def _ai_core(req: "AIRequest", x_telegram_init_data: Optional[str] = None, strea
                 "is only what you would say out loud to the client."
             )
         elif is_review_question:
+            # Разбор приходит без session_id, поэтому истории диалога у него нет —
+            # и он не видел плана, который сам же выдал утром. Из-за этого он ругал
+            # человека за то, что тот в точности выполнил указание: «разгибание
+            # 40×12 три подхода — прогресса ноль», хотя ровно это и было назначено.
+            # Достаём последние реплики тренера за сутки и кладём отдельным блоком,
+            # а не в историю: разбор должен остаться одним запросом со своей схемой,
+            # иначе модель начнёт отвечать на утренний вопрос заново.
+            prior_plan = ""
+            if user:
+                try:
+                    with SessionLocal() as db_plan:
+                        # Окно считаем через NOW(), а не через datetime.utcnow():
+                        # created_at в эту таблицу пишется SQL-функцией NOW(), и в
+                        # наивную колонку она кладёт время в зависимости от TimeZone
+                        # сессии. Сравнивая NOW() с NOW(), мы не зависим от того,
+                        # что там настроено, — обе стороны идут от одних часов.
+                        # INTERVAL у pg8000 обязан быть literal'ом, не параметром.
+                        _rows = db_plan.execute(text("""
+                            SELECT role, content FROM (
+                                SELECT role, content, id FROM ai_chat_history
+                                WHERE user_id=:uid AND created_at >= NOW() - INTERVAL '24 hours'
+                                ORDER BY id DESC LIMIT 6
+                            ) t ORDER BY id ASC
+                        """), {"uid": user.id}).fetchall()
+                    if _rows:
+                        # Длинный слот отдаём последнему ответу ТРЕНЕРА, а не просто
+                        # последней строке: диалог обычно кончается коротким «сохрани» →
+                        # «ок, положил в план», и нетронутым оставался именно он, а план
+                        # с весами резался. Состав упражнений дописывается в конец
+                        # сохранённого ответа, то есть обрезался бы первым.
+                        _keep = max((i for i, r in enumerate(_rows) if r[0] == "assistant"),
+                                    default=len(_rows) - 1)
+                        _parts = []
+                        for _i, _r in enumerate(_rows):
+                            _who = "CLIENT ASKED" if _r[0] == "user" else "YOU ANSWERED"
+                            # Предел и у него тоже: ответ с планом может быть почти на
+                            # весь max_tokens, а разбор не кэшируется и платится целиком.
+                            _txt = (_r[1] or "")[:2500] if _i == _keep else (_r[1] or "")[:600]
+                            _parts.append(f"{_who}: {_txt}")
+                        prior_plan = (
+                            "\n\nWHAT YOU TOLD THIS CLIENT IN CHAT DURING THE LAST 24 HOURS "
+                            "(this is the plan they were following — judge the session against IT, "
+                            "not against some ideal progression):\n" + "\n\n".join(_parts)
+                        )
+                except Exception as _e:
+                    logger.warning(f"[ai] не удалось прочитать план перед разбором: {_e}")
+
             extra_instructions = (
                 "\n\nThis is a review of a workout the client has JUST finished. Do not propose a full workout plan "
                 "and do not list exercises for a future session — a short directive for the next session is enough.\n"
-                "Tie the review to your own previous advice: the TODAY'S WORKOUT and PREVIOUS WORKOUTS sections "
+                "Tie the review to your own previous advice: the LAST COMPLETED SESSION and PREVIOUS WORKOUTS sections "
                 "contain the notes you wrote after earlier sessions. Say explicitly whether what you asked for last "
-                "time actually happened, and if DAYS SINCE PREVIOUS WORKOUT shows a break, address that break first."
+                "time actually happened, and if DAYS SINCE PREVIOUS TRAINING shows a break, address that break first.\n"
+                "If a section with what you told them in chat is present below, the client was following THAT. "
+                "Do not criticise them for hitting the numbers you prescribed, and do not call an exercise "
+                "'no progress' when you yourself asked them to repeat it. If you now think the prescription was "
+                "wrong, say that it was your call and what you would change — do not put it on the client."
+                + prior_plan
             )
         context = base_context + f"\n\nQUESTION: {req.question}" + extra_instructions
     else:
